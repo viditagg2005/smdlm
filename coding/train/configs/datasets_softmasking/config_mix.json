@@ -1,0 +1,11 @@
+{
+  "job_name": "softmasking---mix",
+  "model_path": "mihoesche/Dream-v0-Instruct-7B-SM",
+  "softmasking": true,
+
+  "data_path": "mix",
+  "data_subset": null,
+  "is_messages": true,
+  "prompt_column": null,
+  "response_column": null
+}

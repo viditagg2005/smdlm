@@ -1,0 +1,238 @@
+diff -urN original/generation_utils.py modified/generation_utils.py
+--- original/generation_utils.py	2026-02-23 09:57:44.251314000 -0500
++++ modified/generation_utils.py	2026-02-23 10:04:10.220993000 -0500
+@@ -30,6 +30,7 @@
+     is_torchdynamo_compiling,
+     logging,
+ )
++from .softmasking_utils import SMArgs, get_mixing_factors_for_softmasking
+ 
+ logger = logging.get_logger(__name__)
+ 
+@@ -352,12 +353,27 @@
+             attention_mask=attention_mask 
+         )
+ 
++        ###### LOAD IN Softmasking PARAMETERS ######
++        sm_args = SMArgs(
++            sm_alg=kwargs.pop("transparency_alg", "none"),
++            sm_schedule=kwargs.pop("transparency_scheduling", "none"),
++            scale=kwargs.pop("transparency_scale", 0.0),
++            steepness=kwargs.pop("transparency_steepness", 0.0),
++            offset=kwargs.pop("transparency_centre", 0.0),
++            mixinputs_k=kwargs.pop("mixinputs_k", 1),
++            mixinputs_temp=kwargs.pop("mixture_temp", 1.0),
++        )
++        #############################################
++
++        print(f"SM parameters used in generation: {sm_args}")
++
+         result = self._sample(
+             input_ids,
+             attention_mask=attention_mask,
+             generation_config=generation_config,
+             generation_tokens_hook_func=generation_tokens_hook_func,
+-            generation_logits_hook_func=generation_logits_hook_func
++            generation_logits_hook_func=generation_logits_hook_func,
++            sm_args=sm_args
+         )
+         return result
+ 
+@@ -367,7 +383,8 @@
+         attention_mask: Optional[torch.LongTensor],
+         generation_config: DreamGenerationConfig,
+         generation_tokens_hook_func,
+-        generation_logits_hook_func
++        generation_logits_hook_func,
++        sm_args: SMArgs,
+     ) -> Union[DreamModelOutput, torch.LongTensor]:
+         # init values
+         output_history = generation_config.output_history
+@@ -406,9 +423,18 @@
+ 
+         # this allows user-defined token control of the intermediate steps
+         x = generation_tokens_hook_func(None, x, None)
++
++        # Initialize necessary SM variables
++        inputs_embeds = None
++        embed_weights = self.get_input_embeddings().weight # (V,D)
++        max_gen_length = (x == mask_token_id).sum().item()
++
+         for i in range(steps):
+             mask_index = (x == mask_token_id)
+-            logits = self(x, attention_mask, tok_idx).logits
++            if inputs_embeds is None:
++                logits = self(x, attention_mask, tok_idx).logits
++            else:
++                logits = self(inputs_embeds=inputs_embeds, attention_mask=attention_mask, position_ids=tok_idx).logits
+             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+ 
+             # this allows user-defined logits control of the intermediate steps
+@@ -452,6 +478,17 @@
+             # this allows user-defined token control of the intermediate steps
+             x = generation_tokens_hook_func(i, x, logits)
+ 
++            # DO SOFTMASKING MIXING
++            if sm_args.sm_alg != "none":
++                p_sm = get_mixing_factors_for_softmasking(
++                    x, 
++                    logits, 
++                    mask_token_id, 
++                    max_gen_length, 
++                    sm_args
++                )
++                inputs_embeds = torch.matmul(p_sm, embed_weights)  # (B,T,D)
++
+             if histories is not None:
+                 histories.append(x.clone())
+         
+diff -urN original/modeling_dream.py modified/modeling_dream.py
+--- original/modeling_dream.py	2026-02-23 09:57:44.665080000 -0500
++++ modified/modeling_dream.py	2026-02-23 10:04:10.229835000 -0500
+@@ -744,6 +744,20 @@
+ 
+         # Initialize weights and apply final processing
+         self.post_init()
++    
++    # Apparently needed for LM Eval backend
++    # Adapted from LLaDa-Instruct
++    def prepare_inputs_for_generation(
++        self, input_ids: torch.LongTensor, past_key_values: Optional[List[Tuple]] = None, **kwargs
++    ):
++        if past_key_values:
++            # This is because we want the model to only process the last generated token.
++            input_ids = input_ids[:, -1:]
++        model_inputs = {"input_ids": input_ids, "past_key_values": past_key_values}
++
++        model_inputs.update(kwargs)
++        model_inputs["use_cache"] = kwargs.pop("use_cache", self.config.use_cache)
++        return model_inputs
+ 
+     def reset_rope_parameters(self):
+         self.model.rotary_emb.reset_parameters()
+diff -urN original/softmasking_utils.py modified/softmasking_utils.py
+--- original/softmasking_utils.py	1969-12-31 19:00:00.000000000 -0500
++++ modified/softmasking_utils.py	2026-02-23 10:04:10.232656000 -0500
+@@ -0,0 +1,122 @@
++import torch
++import torch.nn.functional as F
++from dataclasses import dataclass
++
++@dataclass
++class SMArgs:
++    """Arguments for Softmasking"""
++
++    # sm algorithm
++    sm_alg: str = "none" # "mixinputs_with_topk" or "mixinputs_with_temp"
++    sm_schedule: str = "none"  # "none", "linear", or "stepwise"
++
++    # lambda(·) parameters
++    scale: float = 0.0          # overall strength of mixing (0 disables mixing)
++    steepness: float = 0.0      # sigmoid steepness for entropy->lambda map
++    offset: float = 0.0         # sigmoid offset entropy->lambda map
++    
++    # used only when sm_alg == "mixinputs_with_topk"
++    mixinputs_k: int = 3
++    # used only when sm_alg == "mixinputs_with_temp"
++    mixinputs_temp: float = 1.0
++
++def get_mixing_factors_for_softmasking(input_ids, logits_prelim, mask_token_id, max_gen_length, sm_args):
++    """Compute mixing factors and output probabilities for Softmasking."""
++
++    # Create a one-hot distribution for the original input `xt`.
++    xt_one_hot = F.one_hot(input_ids, num_classes=logits_prelim.shape[-1]).to(logits_prelim.dtype)
++    
++    # First get the negative entropy to calculate lambda
++    temperature = sm_args.mixinputs_temp if sm_args.sm_alg == "mixinputs_with_temp" else 1.0
++    neg_entropy, p = get_neg_entropy_and_probabilities(logits_prelim, temperature=temperature)
++
++    # Update scale with schedule if needed
++    if sm_args.sm_schedule != "none":
++        num_mask_token = (input_ids == mask_token_id).sum().item()
++        scale = get_time_dependence(
++            max_gen_length=max_gen_length,
++            num_mask_token=num_mask_token,
++            scale=sm_args.scale,
++            schedule=sm_args.sm_schedule
++        )
++    else:
++        scale = sm_args.scale
++
++    # Calculate lambda tensor
++    mask_positions = (input_ids == mask_token_id)
++    lambda_tensor = calculate_lambda_tensor(neg_entropy, mask_positions, 
++                                            scale, sm_args.steepness, sm_args.offset)
++
++    if sm_args.sm_alg == "mixinputs_with_topk":
++        # Only fill probabilities for top-k tokens
++        p = get_only_topk_probs(logits_prelim, sm_args.mixinputs_k)
++
++    # Create convex combination for output probabilities
++    p_out = (1 - lambda_tensor) * xt_one_hot \
++                + lambda_tensor * p
++
++    return p_out
++
++def get_neg_entropy_and_probabilities(logits, temperature=1.0):
++    """Get negative entropy and probabilities from logits"""
++
++    epsilon = 1e-10
++    p = torch.softmax(logits / temperature, dim=-1)   # (B,T,V)
++    logp = torch.log(p + epsilon)
++    neg_entropy = torch.sum(p * logp, dim=-1)
++    return neg_entropy, p
++
++def calculate_lambda_tensor(neg_entropy, mask_positions, scale, steepness, offset):
++    """Calculate lambda tensor from negative entropy"""
++    
++    if neg_entropy is None or scale == 0.0:
++        return torch.zeros_like(neg_entropy)
++    
++    # scale negative entropy to [0,1] using sigmoid
++    lambda_tensor = neg_entropy
++    lambda_tensor = scale * torch.sigmoid(steepness * (lambda_tensor - offset))
++
++    # apply only on mask positions
++    lambda_tensor = torch.where(mask_positions, lambda_tensor, torch.zeros_like(lambda_tensor))
++    return lambda_tensor.unsqueeze(-1) # (B,T,1)
++
++def get_only_topk_probs(logits, mixinputs_k=3):
++    """Compute a full-vocabulary probability tensor where only the top-k tokens per position
++   receive softmax probabilities and all other entries are zero."""
++
++    topk_logits, topk_indices = torch.topk(logits, k=mixinputs_k, dim=-1)  # (batch_size, seq_len, k)
++
++    topk_probs = torch.softmax(topk_logits, dim=-1)  # (batch_size, seq_len, k)
++    topk_sum = topk_probs.sum(dim=-1)  # (batch_size, seq_len)
++    assert torch.allclose(topk_sum, torch.ones_like(topk_sum), atol=1e-1), \
++        f"Top-k softmax probabilities do not sum to 1: max deviation = {(topk_sum - 1).abs().max().item()}"
++
++    probs_full = torch.zeros_like(logits)                                 # (B, L, V)
++    probs_full.scatter_(-1, topk_indices, topk_probs)                     # fill top-k
++    assert torch.sum(probs_full > 0).item() == mixinputs_k * logits.shape[0] * logits.shape[1], \
++        f"Number of non-zero entries in probs_full is incorrect: got {torch.sum(probs_full > 0).item()}, expected {mixinputs_k * logits.shape[0] * logits.shape[1]}"
++    
++    return probs_full
++
++def get_time_dependence(
++    max_gen_length: int,
++    num_mask_token: int,
++    scale: float,
++    schedule: str,
++    sm_to_hm: bool = True,
++    threshold: float = 0.5,
++) -> float:
++    """Return scale factor depending on decoding progress."""
++    t = num_mask_token / max_gen_length if max_gen_length else 1.0
++
++    if schedule == "none":
++        return scale
++
++    if schedule == "linear":
++        return scale * (t if sm_to_hm else 1 - t)
++
++    if schedule == "stepwise":
++        cond = t > threshold if sm_to_hm else t < threshold
++        return scale if cond else 0
++
++    raise ValueError(f"Unknown schedule: {schedule}")

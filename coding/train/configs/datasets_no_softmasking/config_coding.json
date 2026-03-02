@@ -1,0 +1,11 @@
+{
+  "job_name": "no_softmasking---coding",
+  "model_path": "<YOUR_HF_USERNAME>/models/Dream-Coder-v0-Instruct-7B-SM",
+  "softmasking": false,
+
+  "data_path": "inclusionAI/Ling-Coder-SFT",
+  "data_subset": null,
+  "is_messages": true,
+  "prompt_column": null,
+  "response_column": null
+}

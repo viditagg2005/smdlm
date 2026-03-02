@@ -1,0 +1,16 @@
+name: mdlm_sm
+backbone: dit  # dit / dimamba / hf_dit
+parameterization: subs
+time_conditioning: False
+T: 0  # 0 (continuous time) / 1000 
+subs_masking: False
+causal_attention: False
+ignore_bos: False
+loss_type: elbo
+tran_head: 
+  init_scale: 0.0 
+  init_centre: -0.75
+  init_steep: 6.66
+  init_temperature: 1.0
+  mixinputs_k : 3 
+  transparency_alg: mixinputs_with_topk

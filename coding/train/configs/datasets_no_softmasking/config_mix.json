@@ -1,0 +1,11 @@
+{
+  "job_name": "no_softmasking---mix",
+  "model_path": "<YOUR_HF_USERNAME>/Dream-v0-Instruct-7B-SM",
+  "softmasking": false,
+
+  "data_path": "mix",
+  "data_subset": null,
+  "is_messages": true,
+  "prompt_column": null,
+  "response_column": null
+}

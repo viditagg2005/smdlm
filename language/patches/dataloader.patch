@@ -1,0 +1,62 @@
+861a862,922
+> 
+> def load_human_references(seq_len, num_samples_needed, seed, cache_dir, logger, tokenizer, config): 
+>     
+>     cache_filename = (
+>         f"human_refs_cache_seed{seed}_"
+>         f"len{seq_len}_count{num_samples_needed}.json"
+>     )
+>     # Saves cache file to the current hydra output directory
+>     cache_path = os.path.join(cache_dir, cache_filename) 
+> 
+>     human_references = []
+>     
+>     # --- 2. Try Loading from Cache ---
+>     try:
+>         logger.info(f"Attempting to load cached references from: {cache_path}")
+>         with open(cache_path, 'r') as f:
+>             human_references = json.load(f)
+>         
+>         if len(human_references) == num_samples_needed:
+>             logger.info("Cache hit! Successfully loaded matching references.")
+>         else:
+>             # This handles cases where a previous run was interrupted
+>             logger.warning(
+>                 f"Cache file has {len(human_references)} samples, "
+>                 f"but {num_samples_needed} are needed. Re-generating."
+>             )
+>             human_references = [] # Reset to force re-generation
+>             
+>     except (FileNotFoundError, json.JSONDecodeError) as e:
+>         logger.info(f"Cache miss or invalid file ({e}). Generating new references.")
+>         human_references = [] # Ensure it's empty
+> 
+>     # --- 3. Generate and Save if Cache Miss ---
+>     if not human_references: # Only run this if loading failed
+>         logger.info('Generating human references from dataloader...')
+>         
+>         _, valid_loader = get_dataloaders(
+>             config, tokenizer, valid_seed=config.seed, skip_train=True
+>         )
+>         
+>         # Iterate through the dataloader efficiently
+>         for batch in valid_loader:
+>             input_ids = batch['input_ids']
+>             human_references.extend(tokenizer.batch_decode(input_ids))
+>             
+>             # Stop loading as soon as we have enough references
+>             if len(human_references) >= num_samples_needed:
+>                 break
+>         
+>         # Trim the list to be the exact size
+>         human_references = human_references[:num_samples_needed]
+>         
+>         # Save the newly generated list to the cache
+>         logger.info(f"Saving {len(human_references)} references to cache: {cache_path}")
+>         try:
+>             with open(cache_path, 'w') as f:
+>                 json.dump(human_references, f) 
+>         except Exception as e:
+>             logger.error(f"Failed to write cache file: {e}")
+>     
+>     return human_references 

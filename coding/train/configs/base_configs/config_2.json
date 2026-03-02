@@ -1,0 +1,48 @@
+{
+  "output_dir": "peft_adaptor_2/",
+
+  "seed": 1232,
+
+  "mixinputs_k": 1,
+  "transparency_alg": "mixinputs_with_topk",
+  "loss_calc": "model_weighted",
+  "softmasking_prob": 0.5,
+
+  "init_scale": 0.0,
+  "init_centre": -0.75,
+  "init_steep": 6.66,
+
+  "r": 16,
+  "lora_alpha": 16,
+  "lora_dropout": 0.0,
+  "bias": "none",
+  "use_dora": true,
+  "target_modules": ["q_proj","k_proj","v_proj","o_proj"],
+  "modules_to_save": [],
+  "layers_to_transform": null,
+  "layers_pattern": null,
+
+  "num_train_epochs": 1,
+  "gradient_accumulation_steps": 8,
+  "per_device_train_batch_size": 1,
+  "per_device_eval_batch_size": 1,
+
+  "learning_rate": 1e-5,
+  "lr_scheduler_type": "cosine",
+  "warmup_ratio": 0.03,
+  "max_grad_norm": 7.0,
+
+  "eval_strategy": "steps",
+  "eval_steps": 100,
+  "eval_on_start": true,
+  "logging_steps": 2,
+  "save_steps": 100,
+  "save_total_limit": 10,
+  
+  "load_best_model_at_end": true,
+  "bf16": true,
+  "remove_unused_columns": false,
+  "dataloader_num_workers": 0,
+  "gradient_checkpointing": true,
+  "report_to": "wandb"
+}
