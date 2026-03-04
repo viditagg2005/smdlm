@@ -32,6 +32,7 @@ class TransparencyHead(nn.Module):
 
         self.mixinputs_k = getattr(trans_args, "mixinputs_k", 3) 
         self.transparency_alg = getattr(trans_args, "transparency_alg", "mixinputs_with_topk")
+        self.interpolation = getattr(trans_args, "interpolation", "linear")
 
         self.epsilon = 1e-6
 
@@ -51,30 +52,88 @@ class TransparencyHead(nn.Module):
     def temperature(self):
         return F.softplus(self.raw_temperature) + self.epsilon
 
-    def forward(self, input_ids, logits_prelim):
+    def forward(self, input_ids, logits_prelim, embed_weight=None):
+        """
+        Args:
+            input_ids:      (B, T) token ids.
+            logits_prelim:  (B, T, V) logits from the preliminary pass.
+            embed_weight:   (V, D) embedding weight matrix. Required when
+                            interpolation == "spherical"; ignored otherwise.
+        Returns:
+            If interpolation == "linear":  (B, T, V) probability simplex.
+            If interpolation == "spherical": (B, T, D) dense embeddings.
+        """
 
-         # Create a one-hot distribution for the original input `xt`.
-        xt_one_hot = F.one_hot(input_ids, num_classes=logits_prelim.shape[-1]).to(logits_prelim.dtype)
-        
-        # First get the negative entropy to calculate lambda
+        # --- 1. Compute lambda (shared by both modes) ---
         temperature = self.temperature if self.transparency_alg == "mixinputs_with_temp" else 1.0
         neg_entropy, p = self.get_neg_entropy_and_probabilities(logits_prelim, temperature=temperature)
 
-        # Get mask positions
         mask_positions = (input_ids == self.mask_token_id)
-
-        # calculate lambda tensor
-        lambda_tensor = self.calculate_lambda_tensor(neg_entropy, mask_positions) # (B,T,1)
+        lambda_tensor = self.calculate_lambda_tensor(neg_entropy, mask_positions)  # (B,T,1)
 
         if self.transparency_alg == "mixinputs_with_topk":
-            # Mix only top-k embeddings based on their softmax probabilities (after topk selection)
             p = self.get_only_topk_probs(logits_prelim, self.mixinputs_k)
 
-        # Create convex combination 
-        p_out = (1 - lambda_tensor) * xt_one_hot \
-                    + lambda_tensor * p
+        # --- 2. Branch on interpolation mode ---
+        if self.interpolation == "spherical":
+            assert embed_weight is not None, \
+                "embed_weight must be provided for spherical interpolation"
+            return self._slerp_interpolate(input_ids, p, lambda_tensor, embed_weight)
+        else:
+            # Original linear path: returns (B,T,V) probability simplex
+            xt_one_hot = F.one_hot(input_ids, num_classes=logits_prelim.shape[-1]).to(logits_prelim.dtype)
+            p_out = (1 - lambda_tensor) * xt_one_hot + lambda_tensor * p
+            return p_out
 
-        return p_out
+    def _slerp_interpolate(self, input_ids, p, lambda_tensor, embed_weight):
+        """
+        Spherical Linear Interpolation (SLERP) in the dense embedding space.
+
+        Args:
+            input_ids:    (B, T)   token ids (mask token at masked positions).
+            p:            (B, T, V) probability distribution over vocab.
+            lambda_tensor:(B, T, 1) confidence weight per position.
+            embed_weight: (V, D)   embedding table weights.
+
+        Returns:
+            e_final:      (B, T, D) dense embeddings ready for the backbone.
+        """
+        # Step 1: Project into dense embedding space
+        e_m = F.embedding(input_ids, embed_weight)           # (B, T, D)
+        e_pred = torch.matmul(p.to(embed_weight.dtype), embed_weight)  # (B, T, D)
+
+        # Step 2: L2 normalisation
+        e_m_norm = e_m.norm(dim=-1, keepdim=True)            # (B, T, 1)
+        e_hat_m    = e_m / (e_m_norm + self.epsilon)
+        e_hat_pred = e_pred / (e_pred.norm(dim=-1, keepdim=True) + self.epsilon)
+
+        # Step 3: Compute angle Ω between the two unit vectors
+        dot = (e_hat_m * e_hat_pred).sum(dim=-1, keepdim=True)  # (B, T, 1)
+        dot = dot.clamp(-1.0, 1.0)
+        omega = torch.acos(dot)                                 # (B, T, 1)
+        sin_omega = torch.sin(omega)                            # (B, T, 1)
+
+        # Step 4: SLERP with linear fallback for small angles
+        safe = sin_omega.abs() > self.epsilon
+
+        # SLERP coefficients (only valid where safe == True)
+        coeff_m    = torch.sin((1.0 - lambda_tensor) * omega) / (sin_omega + self.epsilon)
+        coeff_pred = torch.sin(lambda_tensor * omega)          / (sin_omega + self.epsilon)
+
+        # Linear fallback coefficients
+        coeff_m_lin    = 1.0 - lambda_tensor
+        coeff_pred_lin = lambda_tensor
+
+        # Select per-position
+        coeff_m    = torch.where(safe, coeff_m,    coeff_m_lin)
+        coeff_pred = torch.where(safe, coeff_pred, coeff_pred_lin)
+
+        e_slerp = coeff_m * e_hat_m + coeff_pred * e_hat_pred   # (B, T, D)
+
+        # Step 5: Rescale by the original mask-token embedding magnitude
+        e_final = e_slerp * e_m_norm
+
+        return e_final
 
     def get_neg_entropy_and_probabilities(self, logits, temperature=1.0):
         """Get negative entropy and probabilities from logits"""
@@ -153,6 +212,7 @@ def get_th_kwargs(model, verbose=False):
         "transparency_centre": th.centre.to(dtype).item(),
         "mixture_temp": th.temperature.to(dtype).item(),
         "mixinputs_k": th.mixinputs_k,
+        "interpolation": th.interpolation,
         "transparency_scheduling": "none",  # we dont train with time_dependence
     }
     # if verbose:

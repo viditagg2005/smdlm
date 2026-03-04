@@ -32,6 +32,7 @@ class TransparencyArgs:
     init_scale: float = 0.0
     init_centre: float = -0.75
     init_steep: float = 10/1.5
+    interpolation: str = "linear"  # Options: "linear", "spherical"
 
 @dataclass
 class LoraArgs:

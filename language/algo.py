@@ -173,9 +173,19 @@ class MDLM_SM(MDLM):
 
     with torch.cuda.amp.autocast(dtype=torch.float32):
       if log_p_x0 is not None:
+          # Get embedding weight for potential SLERP usage
+          embed_weight = self.backbone.vocab_embed.weight
           # If previous predictions are available, create a soft-masked input
-          p_x0_sm = self.tran_head(xt, log_p_x0)
-          model_output = self.backbone(p_x0_sm, sigma=sigma_processed)
+          sm_out = self.tran_head(xt, log_p_x0, embed_weight=embed_weight)
+
+          if self.tran_head.interpolation == "spherical":
+              # SLERP path: sm_out is (B,T,D) dense embeddings
+              # Pass directly as input_embeds, bypassing the embedding table
+              model_output = self.backbone(
+                  xt, sigma=sigma_processed, input_embeds=sm_out)
+          else:
+              # Linear path: sm_out is (indices, probs) tuple or (B,T,V) simplex
+              model_output = self.backbone(sm_out, sigma=sigma_processed)
       else:
           # Standard forward pass if no previous prediction is available
           model_output = self.backbone(xt, sigma=sigma_processed)
