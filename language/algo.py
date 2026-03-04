@@ -148,11 +148,15 @@ class MDLM_SM(MDLM):
       return [optimizer], [scheduler_dict]
 
   def training_step(self, batch, batch_idx):
-      # Log the computed transparency parameters
-      self.log('transparency/scale', self.tran_head.scale.item(), on_step=True, on_epoch=False, sync_dist=True)
+      # Log the computed transparency parameters (ω_s is the 'scale')
+      self.log('transparency/omega_s', self.tran_head.scale.item(), on_step=True, on_epoch=False, sync_dist=True)
       self.log('transparency/centre', self.tran_head.centre.item(), on_step=True, on_epoch=False, sync_dist=True)
       self.log('transparency/steepness', self.tran_head.steepness.item(), on_step=True, on_epoch=False, sync_dist=True)
       self.log('transparency/temperature', self.tran_head.temperature.item(), on_step=True, on_epoch=False, sync_dist=True)
+
+      # Log interpolation mode (0 = linear, 1 = spherical) for dashboard filtering
+      is_spherical = 1.0 if self.tran_head.interpolation == "spherical" else 0.0
+      self.log('transparency/is_spherical', is_spherical, on_step=True, on_epoch=False, sync_dist=True)
 
       # Call the parent training_step to compute and return the loss
       return super().training_step(batch, batch_idx)
@@ -219,6 +223,12 @@ class MDLM_SM(MDLM):
 
         # Pass 2: Main pass that computes the gradients.
         log_x_theta = self.forward(xt, sigma=sigma, log_p_x0=log_x_theta_pass1)
+
+        # --- SLERP diagnostics (every 100 steps, no grad) ---
+        if (train_mode 
+            and self.tran_head.interpolation == "spherical"
+            and self.global_step % 100 == 0):
+            self._log_slerp_angle_diagnostics(xt, log_x_theta_pass1)
     else:
         # --- Standard Path ---
         log_x_theta = self.forward(xt, sigma=sigma)
@@ -234,6 +244,47 @@ class MDLM_SM(MDLM):
           low_var=train_mode and self.loss_type == 'low_var')
     return loss
     
+  def _log_slerp_angle_diagnostics(self, xt, logits_prelim):
+    """
+    Log SLERP angle diagnostics at masked positions.
+    Tracks mean Ω (radians & degrees) and linear fallback fraction.
+    """
+    with torch.no_grad():
+      mask_positions = (xt == self.mask_index)
+      if not mask_positions.any():
+          return
+
+      embed_weight = self.backbone.vocab_embed.weight
+
+      # Build per-position probability distribution
+      if self.tran_head.transparency_alg == "mixinputs_with_topk":
+          p = self.tran_head._get_topk_full_probs(logits_prelim)
+      else:
+          p = torch.softmax(logits_prelim, dim=-1)
+
+      # Project into embedding space
+      e_m = F.embedding(xt, embed_weight)                               # (B,T,D)
+      e_pred = torch.matmul(p.to(embed_weight.dtype), embed_weight)     # (B,T,D)
+
+      # L2 normalise
+      eps = self.tran_head.epsilon
+      e_hat_m    = e_m / (e_m.norm(dim=-1, keepdim=True) + eps)
+      e_hat_pred = e_pred / (e_pred.norm(dim=-1, keepdim=True) + eps)
+
+      # Angle at masked positions
+      dot = (e_hat_m * e_hat_pred).sum(dim=-1).clamp(-1.0, 1.0)  # (B,T)
+      omega = torch.acos(dot)                                      # (B,T)
+      omega_masked = omega[mask_positions]
+      sin_omega_masked = torch.sin(omega_masked)
+
+      self.log('slerp/mean_omega_rad', omega_masked.mean().item(),
+               on_step=True, on_epoch=False, sync_dist=True)
+      self.log('slerp/mean_omega_deg', (omega_masked * 180.0 / 3.14159).mean().item(),
+               on_step=True, on_epoch=False, sync_dist=True)
+      self.log('slerp/linear_fallback_frac',
+               (sin_omega_masked.abs() < eps).float().mean().item(),
+               on_step=True, on_epoch=False, sync_dist=True)
+
   def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
     """Generate samples from the model."""
 
