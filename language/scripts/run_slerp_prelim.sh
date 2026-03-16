@@ -53,7 +53,7 @@ python3 -u -m main \
   optim.tran_head_lr=0.01 \
   optim.sm_prob=0.8 \
   trainer.val_check_interval=2000 \
-  strategy.find_unused_parameters=True \
+  strategy=single_gpu \
   ++hydra.run.dir=$SAVEDIR
 
 echo ""
