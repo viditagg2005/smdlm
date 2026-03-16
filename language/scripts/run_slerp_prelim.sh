@@ -36,7 +36,7 @@ echo ""
 echo "============================================"
 echo "  Step 4: Launch SLERP training"
 echo "============================================"
-python -u -m main \
+python3 -u -m main \
   trainer.max_steps=100_000 \
   trainer.devices=1 \
   data.cache_dir=$DATA_CACHE_DIR \
