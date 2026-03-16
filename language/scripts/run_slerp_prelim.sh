@@ -3,12 +3,15 @@ set -e
 
 ##############################################
 # SM-MDLM SLERP Preliminary Test
-# Single A100 GPU
+# Single A100 GPU | WandB Disabled
 ##############################################
 
 SEED=1
 SAVEDIR="outputs/sm_mdlm_slerp_prelim_${SEED}"
 DATA_CACHE_DIR='.'   # <-- set this to your data cache directory
+
+# Disable WandB for prelim test
+export WANDB_MODE=disabled
 
 echo "============================================"
 echo "  Step 1: Setup (fetch missing files + patch)"
@@ -37,8 +40,8 @@ python -u -m main \
   trainer.max_steps=100_000 \
   trainer.devices=1 \
   data.cache_dir=$DATA_CACHE_DIR \
-  loader.batch_size=32 \
-  loader.eval_batch_size=32 \
+  loader.batch_size=16 \
+  loader.eval_batch_size=16 \
   loader.num_workers=8 \
   seed=$SEED \
   wandb.name="mdlm-sm-slerp-prelim-seed${SEED}" \
